@@ -47,6 +47,8 @@ Every route does input parsing and response formatting; all business logic lives
 
 **Bug:** `update_listening_streak` had an extra guard: `elif days_since_last == 1 and today.weekday() != 6`. `weekday() == 6` is Sunday, so listening on Sunday after Saturday never incremented the streak — it fell through to the reset branch.
 
+**How I reproduced it:** The condition is only hit when `today` is a Sunday. Simulated by passing `last_listened_at = Saturday 2026-06-27` and `now = Sunday 2026-06-28` (confirmed `date(2026,6,28).weekday() == 6`) with a current streak of 5. The buggy function returned streak=1 (RESET) instead of the expected 6 (increment).
+
 **Fix:** Removed `and today.weekday() != 6`. The condition is simply `days_since_last == 1`.
 
 ```python
@@ -77,7 +79,18 @@ RECENT_THRESHOLD = timedelta(minutes=30)
 
 ### Issue 3 — Duplicate songs in search results (`search_service.py`)
 
-**Bug:** `search_songs` joined `song_tags` with `outerjoin` to include tag data. If a song has multiple tags, the join produces one row per tag, so the same song appears in results multiple times.
+**Bug:** `search_songs` joins `song_tags` via `outerjoin` but the filter only uses `Song.title` and `Song.artist` — the join serves no filtering purpose and multiplies rows. For a song with N tags, the SQL produces N rows with the same song ID.
+
+**How I reproduced it:** Confirmed at the SQL level — searching for "Borough" (matches "Crown Heights Anthem" by "Borough Kings", which has 3 tags: rap, hip-hop, boom bap) produces 3 raw SQL rows for the same song ID. Running the raw SQL:
+
+```sql
+SELECT s.id, s.title, st.tag_id
+FROM song s LEFT JOIN song_tags st ON s.id = st.song_id
+WHERE s.artist LIKE '%Borough%'
+-- Returns 3 rows, all same song ID
+```
+
+Note: SQLAlchemy 2.0's identity map deduplicates ORM objects, so the symptom is masked at the Python layer with this SQLAlchemy version. The fix (`.distinct()`) is still correct — it eliminates the redundant rows at the SQL level, preventing the bug from appearing if the caller ever switches to raw SQL or a different ORM version.
 
 **Fix:** Added `.distinct()` to the query so each song appears at most once.
 
@@ -96,6 +109,8 @@ RECENT_THRESHOLD = timedelta(minutes=30)
 
 **Bug:** `rate_song()` saved the rating and committed but never created a `Notification`. The `add_to_playlist()` function correctly notified the sharer, but `rate_song()` had no equivalent call.
 
+**How I reproduced it:** Used seed data — nova shared "Midnight Drive", simone is a friend. Ran the original `rate_song` logic (save Rating, commit, no notification call). Checked `Notification` table filtered by `notification_type='song_rated'` for nova before and after — count stayed at 0 new entries despite a valid rating being saved.
+
 **Fix:** Added a `create_notification()` call after committing the rating, mirroring the pattern in `add_to_playlist()`.
 
 ```python
@@ -112,6 +127,8 @@ if song.shared_by != user_id:
 ### Issue 5 — Last song in playlist never shows up (`playlist_service.py`)
 
 **Bug:** `get_playlist_songs` returned `songs[:-1]` — a Python slice that drops the final element of the list. The last song in every playlist was silently excluded.
+
+**How I reproduced it:** Used seed data — "Late Night Vibes" playlist contains 7 songs (positions 1–7). Queried the songs ordered by position: the list is `[Midnight Drive, Still Waters, First Light, Block Party, Late Night Session, Golden Hour, Free Throws]`. Applying `songs[:-1]` returns only the first 6, silently dropping "Free Throws" (position 7). Verified against the `playlist_entries` table that it is genuinely in the playlist.
 
 **Fix:** Changed `songs[:-1]` to `songs`.
 
