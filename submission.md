@@ -41,101 +41,52 @@ Every route does input parsing and response formatting; all business logic lives
 
 ---
 
-## Bugs Fixed (all five)
+## Root Cause Analyses (three chosen bugs)
+
+---
 
 ### Issue 1 — Streak resets on Sundays (`streak_service.py`)
 
-**Bug:** `update_listening_streak` had an extra guard: `elif days_since_last == 1 and today.weekday() != 6`. `weekday() == 6` is Sunday, so listening on Sunday after Saturday never incremented the streak — it fell through to the reset branch.
+**How I reproduced it:** The bug only fires when today is a Sunday. Simulated by calling the original `update_listening_streak` logic with `last_listened_at = Saturday 2026-06-27` and `now = Sunday 2026-06-28` (`date(2026,6,28).weekday() == 6` confirmed). With a current streak of 5, the function returned streak=1 (RESET) instead of 6 (increment).
 
-**How I reproduced it:** The condition is only hit when `today` is a Sunday. Simulated by passing `last_listened_at = Saturday 2026-06-27` and `now = Sunday 2026-06-28` (confirmed `date(2026,6,28).weekday() == 6`) with a current streak of 5. The buggy function returned streak=1 (RESET) instead of the expected 6 (increment).
+**How I found the root cause:** The issue title said "streak keeps resetting" → README pointed to `streak_service.py`. Read the route first: `POST /songs/<id>/listen` in `routes/songs.py` calls `streak_service.record_listening_event()`. That function calls `update_listening_streak(user, now)`. Read `update_listening_streak` top-down and wrote down each branch: `days_since_last == 0` (no-op), `days_since_last == 1 and today.weekday() != 6` (increment), else (reset). The `weekday()` guard in the increment branch immediately stood out — there's no streak rule about the day of the week. Verified by checking Python docs: `weekday()` returns 6 for Sunday, so this guard silently blocks the increment every Sunday and falls through to reset.
 
-**Fix:** Removed `and today.weekday() != 6`. The condition is simply `days_since_last == 1`.
+**Root cause:** In `update_listening_streak` (`streak_service.py:73`), the increment branch had an extra condition `and today.weekday() != 6`. Python's `datetime.weekday()` returns 6 for Sunday, so any time a user listened on Sunday after listening on Saturday (`days_since_last == 1`), the condition evaluated to `False` and fell through to the `else` branch, which resets the streak to 1. The streak rule says nothing about day of week — consecutive calendar days should always increment.
 
-```python
-# before
-elif days_since_last == 1 and today.weekday() != 6:
-
-# after
-elif days_since_last == 1:
-```
-
----
-
-### Issue 2 — Friends Listening Now shows yesterday's listeners (`feed_service.py`)
-
-**Bug:** `RECENT_THRESHOLD = timedelta(hours=24)` is too broad for a "listening now" feature. Anyone who listened in the last 24 hours — including yesterday — would appear as "listening now."
-
-**Fix:** Changed the threshold to 30 minutes.
-
-```python
-# before
-RECENT_THRESHOLD = timedelta(hours=24)
-
-# after
-RECENT_THRESHOLD = timedelta(minutes=30)
-```
-
----
-
-### Issue 3 — Duplicate songs in search results (`search_service.py`)
-
-**Bug:** `search_songs` joins `song_tags` via `outerjoin` but the filter only uses `Song.title` and `Song.artist` — the join serves no filtering purpose and multiplies rows. For a song with N tags, the SQL produces N rows with the same song ID.
-
-**How I reproduced it:** Confirmed at the SQL level — searching for "Borough" (matches "Crown Heights Anthem" by "Borough Kings", which has 3 tags: rap, hip-hop, boom bap) produces 3 raw SQL rows for the same song ID. Running the raw SQL:
-
-```sql
-SELECT s.id, s.title, st.tag_id
-FROM song s LEFT JOIN song_tags st ON s.id = st.song_id
-WHERE s.artist LIKE '%Borough%'
--- Returns 3 rows, all same song ID
-```
-
-Note: SQLAlchemy 2.0's identity map deduplicates ORM objects, so the symptom is masked at the Python layer with this SQLAlchemy version. The fix (`.distinct()`) is still correct — it eliminates the redundant rows at the SQL level, preventing the bug from appearing if the caller ever switches to raw SQL or a different ORM version.
-
-**Fix:** Added `.distinct()` to the query so each song appears at most once.
-
-```python
-# before
-.all()
-
-# after
-.distinct()
-.all()
-```
+**Fix and side-effect check:** Removed `and today.weekday() != 6` so the branch is simply `elif days_since_last == 1:`. Checked the other two branches: the no-op (`days_since_last == 0`) and reset (`else`) branches are untouched and still correct. Verified the fix with the existing test suite — `test_streak_increments_on_sunday` passes. Also confirmed the Saturday→Monday path (days_since_last == 2) still resets correctly.
 
 ---
 
 ### Issue 4 — No notification when a friend rates a song (`notification_service.py`)
 
-**Bug:** `rate_song()` saved the rating and committed but never created a `Notification`. The `add_to_playlist()` function correctly notified the sharer, but `rate_song()` had no equivalent call.
+**How I reproduced it:** Used seed data: nova shared "Midnight Drive", simone is nova's friend. Ran the original `rate_song` logic (save `Rating`, commit — no `create_notification` call). Queried `Notification` for nova with `notification_type='song_rated'` before and after — count stayed at 0 new entries despite the rating being saved successfully to the DB.
 
-**How I reproduced it:** Used seed data — nova shared "Midnight Drive", simone is a friend. Ran the original `rate_song` logic (save Rating, commit, no notification call). Checked `Notification` table filtered by `notification_type='song_rated'` for nova before and after — count stayed at 0 new entries despite a valid rating being saved.
+**How I found the root cause:** Issue said "notified when added to playlist but not when rated" → this pointed to two parallel code paths in the same service. README call chain: `POST /songs/<id>/rate` → `routes/songs.py` → `notification_service.rate_song()`. Read `routes/songs.py` to confirm the call. Read `notification_service.py` and compared `add_to_playlist()` and `rate_song()` side by side. `add_to_playlist()` ends with `create_notification(...)` after the DB write. `rate_song()` ends with `db.session.commit()` and `return rating` — no notification call. The structural gap was immediately obvious from reading the two functions together.
 
-**Fix:** Added a `create_notification()` call after committing the rating, mirroring the pattern in `add_to_playlist()`.
+**Root cause:** `rate_song()` in `notification_service.py` saves the `Rating` record and commits, but contains no call to `create_notification()`. The parallel function `add_to_playlist()` in the same file correctly notifies the song's sharer after its DB write. The notification step was simply never written into `rate_song()`.
 
-```python
-if song.shared_by != user_id:
-    create_notification(
-        user_id=song.shared_by,
-        notification_type="song_rated",
-        body=f"{rater.username} rated your song '{song.title}' {score}/5.",
-    )
-```
+**Fix and side-effect check:** Added a `create_notification()` call after `db.session.commit()` in `rate_song()`, guarded by `if song.shared_by != user_id` (the same guard `add_to_playlist` uses to avoid self-notifications). The only other code that touches `Notification` creation is `create_notification()` itself and `add_to_playlist()` — both unmodified. Checked `get_notifications()` and `mark_as_read()` — read-only and unaffected. Verified: rating nova's own song does not trigger a notification (self-guard holds); rating another user's song creates exactly one `song_rated` notification for the sharer.
 
 ---
 
 ### Issue 5 — Last song in playlist never shows up (`playlist_service.py`)
 
-**Bug:** `get_playlist_songs` returned `songs[:-1]` — a Python slice that drops the final element of the list. The last song in every playlist was silently excluded.
+**How I reproduced it:** Queried "Late Night Vibes" playlist via `get_playlist_songs`. The `playlist_entries` table shows 7 songs at positions 1–7. The function returned 6 songs — "Free Throws" by Hoop Dreams (position 7) was absent. Confirmed it is in `playlist_entries` with `position=7`; the query fetches it correctly but it never reaches the caller.
 
-**How I reproduced it:** Used seed data — "Late Night Vibes" playlist contains 7 songs (positions 1–7). Queried the songs ordered by position: the list is `[Midnight Drive, Still Waters, First Light, Block Party, Late Night Session, Golden Hour, Free Throws]`. Applying `songs[:-1]` returns only the first 6, silently dropping "Free Throws" (position 7). Verified against the `playlist_entries` table that it is genuinely in the playlist.
+**How I found the root cause:** Issue said "last song never shows up" → README pointed to `playlist_service.py`. Call chain: `GET /playlists/<id>/songs` → `routes/playlists.py` → `playlist_service.get_playlist_songs()`. Read `get_playlist_songs()` top-down. The SQL query is correct — `JOIN playlist_entries`, filter by `playlist_id`, `ORDER BY position ASC`. But the return statement is `return [song.to_dict() for song in songs[:-1]]`. The `[:-1]` slice is the only thing between the correct query result and the response. No conditional, no edge case — it unconditionally drops the last element every time.
 
-**Fix:** Changed `songs[:-1]` to `songs`.
+**Root cause:** `get_playlist_songs()` in `playlist_service.py:66` returns `songs[:-1]` instead of `songs`. Python's `[:-1]` slice drops the last element of a list. For any playlist with N songs, this returns N-1 songs, silently omitting the one at the highest position. This affects every playlist regardless of size.
 
-```python
-# before
-return [song.to_dict() for song in songs[:-1]]
+**Fix and side-effect check:** Changed `songs[:-1]` to `songs`. Checked the only other path that reads playlist songs — `notification_service.add_to_playlist()` imports `get_playlist_songs` to check for duplicates before adding. With the fix it now sees the full song list, which is correct (previously it would miss the last song when checking for duplicates, potentially allowing the same song to be added again). Ran all three playlist tests — `test_playlist_returns_all_songs`, `test_playlist_returns_songs_in_order`, `test_empty_playlist_returns_empty_list` — all pass.
 
-# after
-return [song.to_dict() for song in songs]
-```
+---
+
+## Other bugs also fixed
+
+### Issue 2 — Friends Listening Now shows yesterday's listeners (`feed_service.py`)
+
+`RECENT_THRESHOLD = timedelta(hours=24)` was too broad. Changed to `timedelta(minutes=30)`.
+
+### Issue 3 — Duplicate songs in search results (`search_service.py`)
+
+`search_songs` joined `song_tags` unnecessarily (the filter only uses title/artist). For a song with N tags, the SQL produces N rows with the same song ID. Added `.distinct()`. Note: SQLAlchemy 2.0's identity map masks the symptom at the ORM level, but the raw SQL duplication is real (verified: 3 raw rows for "Crown Heights Anthem" which has 3 tags).
