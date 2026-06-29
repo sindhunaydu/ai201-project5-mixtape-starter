@@ -1,5 +1,23 @@
 # Mixtape Bug Hunt — Submission
 
+## AI Usage
+
+I used Claude (claude-sonnet-4-6 via Claude Code) throughout this project. Here's specifically what I asked it to do and where I had to verify or push back.
+
+**Codebase orientation.** I gave Claude the full contents of each service file and asked "What is this module responsible for? What are its main functions and what does each one do?" This gave me a fast read on which services owned which concerns (streak math vs. notification dispatch vs. playlist ordering) without having to trace every import by hand. The summaries were accurate — I spot-checked them against the code and they held up.
+
+**Data flow tracing.** Before looking at any service, I asked Claude to trace the call chain for "user rates a song" and "user views a playlist" given the routes and services directories. This matched what I found manually: route parses request → delegates to service → service writes DB → service triggers side effects (notifications). Useful for confirming I hadn't missed a layer.
+
+**Explaining specific constructs.** For Issue 1, once I spotted `today.weekday() != 6` I asked "What does Python's `datetime.weekday()` return for each day of the week?" to confirm that 6 = Sunday and not Monday (I always mix up `weekday()` vs `isoweekday()`). The answer was correct and I verified it with `date(2026,6,28).weekday()` in a Python shell.
+
+**Comparing two code paths.** For Issue 4, I pasted `add_to_playlist()` and `rate_song()` side by side and asked "What's the structural difference between these two functions?" Claude immediately identified that `add_to_playlist` calls `create_notification` and `rate_song` doesn't. I had already noticed this myself from reading, but the comparison confirmed I wasn't missing a subtler path where notification gets triggered.
+
+**Where I had to verify myself.** For Issue 3 (duplicate search results), Claude's initial explanation was that the `outerjoin` would cause the same song to appear multiple times in the Python result list. That turned out to be incomplete — SQLAlchemy 2.0's identity map deduplicates ORM objects, so the symptom is masked at the Python layer. I caught this by actually running the buggy query and seeing only 1 result returned despite 3 raw SQL rows. I then ran raw SQL directly to confirm the duplication exists at the database level. Claude's diagnosis pointed me to the right code location, but the "visible duplicate in the list" framing was wrong for this SQLAlchemy version.
+
+**What I did not use AI for.** I did not ask Claude to find the bugs by reading the code. I read each service file myself first, formed a hypothesis about where the bug was, then used AI to help understand specific constructs or compare patterns after I had already located the suspicious code. The one time I tried asking "what's wrong with this function?" before reading it carefully myself, the answer was plausible-sounding but pointed at the wrong line.
+
+---
+
 ## Codebase Map
 
 ### Main files
